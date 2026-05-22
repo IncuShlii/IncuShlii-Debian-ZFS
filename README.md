@@ -58,13 +58,23 @@ APT 源启用 `contrib` 组件。
 上传到 `release_tag` 指定的 GitHub Release。默认 tag 是 `Debian-ZFS`，与当前
 仓库已有 Release 保持一致。
 
+workflow 会先生成待构建列表，然后按单个内核版本拆分成矩阵任务并行构建。这样某个
+架构或内核版本耗时较长时，已经完成的产物会先作为 artifact 保存，最后再统一发布到
+Release。
+
+矩阵构建会按架构选择宿主 runner：`amd64` 使用 `ubuntu-24.04`，`arm64` 使用
+`ubuntu-24.04-arm`。这样 arm64 包会在原生 arm64 runner 上构建，不再通过 QEMU 在
+x64 runner 上模拟编译。
+
 如果所有目标产物都已经存在，workflow 会正常结束，不会上传新的 artifact，也不会
 重复发布 Release asset。
 
 ## 注意事项
 
-- GitHub Actions 使用 `ubuntu-latest` 作为宿主机，但实际构建在 Debian Docker
-  容器中完成。
+- GitHub Actions 的实际构建在 Debian Docker 容器中完成，容器架构会和目标内核架构
+  保持一致。
+- 安装 `linux-headers-*` 时会临时禁用 DKMS autoinstall，避免 header 安装阶段和显式
+  `dkms build` 阶段重复编译同一个 ZFS 模块。
 - `all` 会扫描 Debian APT 源中可见的实际内核 header 版本，但只保留普通架构 flavor
   和 cloud flavor：`amd64` / `cloud-amd64`，以及 `arm64` / `cloud-arm64`。`rt` 等非目标
   flavor 会被过滤；已存在于 Release 的同名产物会在安装编译依赖前跳过。
