@@ -168,6 +168,9 @@ is_supported_kernel_version() {
     local kver="$1"
     local stem tail
 
+    # 必须是具体内核版本 (X.Y.Z...)，排除 6.12-amd64 这类缺少 ABI/patch 版本的元包
+    [[ "$kver" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || return 1
+
     case "$ARCH" in
         amd64|arm64)
             if [[ "$kver" == *"-cloud-${ARCH}" ]]; then
@@ -188,6 +191,19 @@ is_supported_kernel_version() {
             return 1
             ;;
     esac
+}
+
+kernel_requires_backports_zfs() {
+    local kver="$1"
+    local major minor
+    major=$(echo "$kver" | cut -d. -f1)
+    minor=$(echo "$kver" | cut -d. -f2 | cut -d- -f1 | cut -d+ -f1)
+    if [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]]; then
+        if (( major > 6 || (major == 6 && minor >= 2) )); then
+            return 0
+        fi
+    fi
+    return 1
 }
 
 # ========================== 显示横幅 ==========================
@@ -444,6 +460,11 @@ install_build_base() {
 
     # 确保 contrib 源已启用
     local contrib_modified=false
+    local codename=""
+    if [[ -f /etc/os-release ]]; then
+        codename=$(. /etc/os-release && echo "${VERSION_CODENAME:-}")
+    fi
+
     if [[ -f /etc/apt/sources.list.d/debian.sources ]]; then
         if ! grep -E '^\s*Components:.*\bcontrib\b' /etc/apt/sources.list.d/debian.sources &>/dev/null; then
             info "在 debian.sources 中启用 contrib 组件..."
@@ -457,6 +478,23 @@ install_build_base() {
             info "在 sources.list 中启用 contrib 组件..."
             sed -i '/^deb.*main/ { /contrib/! s/main/main contrib/ }' \
                 /etc/apt/sources.list 2>/dev/null || true
+            contrib_modified=true
+        fi
+    fi
+
+    # 检查是否需要 backports 支持 (Linux 6.2+ 内核)
+    local need_backports_zfs=false
+    for k in "${TARGET_KERNELS[@]}"; do
+        if kernel_requires_backports_zfs "$k"; then
+            need_backports_zfs=true
+            break
+        fi
+    done
+
+    if [[ "$need_backports_zfs" == "true" && -n "$codename" ]]; then
+        if [[ ! -f /etc/apt/sources.list.d/backports.list ]] && ! grep -rq "${codename}-backports" /etc/apt/sources.list* 2>/dev/null; then
+            info "目标内核包含 Linux 6.2+，启用 ${codename}-backports 源..."
+            echo "deb http://deb.debian.org/debian ${codename}-backports main contrib" > /etc/apt/sources.list.d/backports.list
             contrib_modified=true
         fi
     fi
@@ -479,10 +517,18 @@ install_build_base() {
     log "编译工具链与内核依赖就绪"
 
     # 安装 ZFS DKMS 源码
-    info "安装 ZFS DKMS 源码包..."
-    if ! run_logged "安装 zfs-dkms" apt-get install -y -qq zfs-dkms; then
-        error "zfs-dkms 安装失败，请确认 Debian contrib 源可用"
-        return 1
+    if [[ "$need_backports_zfs" == "true" && -n "$codename" ]]; then
+        info "目标内核包含 Linux 6.2+，从 ${codename}-backports 安装兼容的 zfs-dkms..."
+        if ! run_logged "安装 zfs-dkms (${codename}-backports)" apt-get install -y -qq -t "${codename}-backports" zfs-dkms; then
+            warn "从 backports 安装失败，回退尝试默认源..."
+            run_logged "安装 zfs-dkms" apt-get install -y -qq zfs-dkms || true
+        fi
+    else
+        info "安装 ZFS DKMS 源码包..."
+        if ! run_logged "安装 zfs-dkms" apt-get install -y -qq zfs-dkms; then
+            error "zfs-dkms 安装失败，请确认 Debian contrib 源可用"
+            return 1
+        fi
     fi
 
     # 兼容处理：部分新版 DKMS (如 DKMS 3.1+) 对 AUTOINSTALL="Y" 大小写敏感
@@ -523,8 +569,24 @@ build_for_kernel() {
     fi
 
     # 安装对应的内核头文件
+    local codename=""
+    if [[ -f /etc/os-release ]]; then
+        codename=$(. /etc/os-release && echo "${VERSION_CODENAME:-}")
+    fi
+    local -a apt_target_args=()
+    if kernel_requires_backports_zfs "$kernel_ver" && [[ -n "$codename" ]]; then
+        apt_target_args=(-t "${codename}-backports")
+        # 确保已安装匹配该内核的 backports zfs-dkms (例如在交互式菜单先编 6.1 后编 6.12 的情况)
+        local current_zfs_ver
+        current_zfs_ver=$(get_zfs_dkms_version || true)
+        if [[ -z "$current_zfs_ver" ]] || [[ "$current_zfs_ver" =~ ^2\.[01]\. ]]; then
+            info "升级 zfs-dkms 到 ${codename}-backports 以支持 ${kernel_ver}..."
+            run_logged "升级 zfs-dkms (${codename}-backports)" apt-get install -y -qq -t "${codename}-backports" zfs-dkms || true
+        fi
+    fi
+
     info "安装 linux-headers-${kernel_ver}..."
-    if ! run_logged "安装 linux-headers-${kernel_ver}" with_dkms_autoinstall_disabled apt-get install -y -qq "linux-headers-${kernel_ver}"; then
+    if ! run_logged "安装 linux-headers-${kernel_ver}" with_dkms_autoinstall_disabled apt-get install -y -qq "${apt_target_args[@]}" "linux-headers-${kernel_ver}"; then
         local header_zfs_ver
         header_zfs_ver=$(get_zfs_dkms_version || true)
         if [[ -n "$header_zfs_ver" ]]; then
