@@ -43,9 +43,26 @@ divider() {
 }
 
 get_zfs_dkms_version() {
+    local ver=""
+
+    # 1. 优先从 /usr/src/zfs-* 源码目录获取（安装 zfs-dkms 后必定存在，最直接可靠）
+    ver=$(find /usr/src -maxdepth 1 -type d -name "zfs-*" 2>/dev/null | head -n1 | sed -E 's|.*/zfs-||' || true)
+    if [[ -n "$ver" ]]; then
+        echo "$ver"
+        return 0
+    fi
+
+    # 2. 从 dpkg-query 查询已安装的 zfs-dkms 版本
+    ver=$(dpkg-query -W -f='${Version}' zfs-dkms 2>/dev/null | sed -E 's/^[0-9]+://' | cut -d- -f1 || true)
+    if [[ -n "$ver" ]]; then
+        echo "$ver"
+        return 0
+    fi
+
+    # 3. 回退到 dkms status
     dkms status 2>/dev/null \
         | awk -F'[/, ]+' '$1 == "zfs" { for (i = 2; i <= NF; i++) if ($i ~ /^[0-9][0-9A-Za-z.+:~_-]*:?$/) { sub(/:$/, "", $i); print $i; exit } }' \
-        | head -n1
+        | head -n1 || true
 }
 
 package_in_skip_list() {
@@ -82,13 +99,15 @@ run_logged() {
         fi
     done
 
-    if wait "$pid"; then
+    local rc=0
+    wait "$pid" || rc=$?
+
+    if [[ "$rc" -eq 0 ]]; then
         rm -f "$log_file"
         return 0
     fi
 
-    local rc=$?
-    error "${description} 失败"
+    error "${description} 失败 (退出码: ${rc})"
     if [[ -s "$log_file" ]]; then
         echo -e "${DIM}  ---- ${description} 输出开始 ----${NC}"
         tail -n 80 "$log_file"
@@ -424,31 +443,40 @@ install_build_base() {
     export DEBIAN_FRONTEND=noninteractive
 
     # 确保 contrib 源已启用
-    local contrib_enabled=false
+    local contrib_modified=false
     if [[ -f /etc/apt/sources.list.d/debian.sources ]]; then
-        grep -q "contrib" /etc/apt/sources.list.d/debian.sources 2>/dev/null && contrib_enabled=true
-    fi
-    if [[ -f /etc/apt/sources.list ]]; then
-        grep -q "contrib" /etc/apt/sources.list 2>/dev/null && contrib_enabled=true
-    fi
-
-    if [[ "$contrib_enabled" == "false" ]]; then
-        info "启用 contrib 组件..."
-        if [[ -f /etc/apt/sources.list.d/debian.sources ]]; then
+        if ! grep -E '^\s*Components:.*\bcontrib\b' /etc/apt/sources.list.d/debian.sources &>/dev/null; then
+            info "在 debian.sources 中启用 contrib 组件..."
             sed -i -E '/^Components:/ { /(^| )contrib( |$)/! s/$/ contrib/ }' \
                 /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
-        elif [[ -f /etc/apt/sources.list ]]; then
+            contrib_modified=true
+        fi
+    fi
+    if [[ -f /etc/apt/sources.list ]]; then
+        if ! grep -E '^\s*deb\s+.*\bcontrib\b' /etc/apt/sources.list &>/dev/null; then
+            info "在 sources.list 中启用 contrib 组件..."
             sed -i '/^deb.*main/ { /contrib/! s/main/main contrib/ }' \
                 /etc/apt/sources.list 2>/dev/null || true
+            contrib_modified=true
         fi
-        apt-get update -qq 2>/dev/null
     fi
 
-    # 安装编译工具链
-    if ! run_logged "安装 build-essential 和 dkms" apt-get install -y -qq build-essential dkms; then
+    # 无论是否修改，都必须确保在纯净 Docker 容器中更新 APT 软件包索引
+    info "更新 APT 软件包索引..."
+    if ! apt-get update -qq; then
+        warn "APT 更新出现警告或部分源失败，继续尝试安装依赖..."
+    fi
+
+    # 安装编译工具链及必要依赖
+    # kmod: 提供 depmod (dkms install 必须) 和 modinfo
+    # dwarves: 提供 pahole (Linux 6.x+ BTF 生成必须)
+    # bc, libelf-dev, libssl-dev: 内核模块构建标准依赖
+    info "安装编译工具链及内核构建依赖..."
+    if ! run_logged "安装构建依赖包" apt-get install -y -qq build-essential dkms kmod dwarves bc libelf-dev libssl-dev; then
+        error "编译基础依赖包安装失败"
         return 1
     fi
-    log "编译工具链就绪"
+    log "编译工具链与内核依赖就绪"
 
     # 安装 ZFS DKMS 源码
     info "安装 ZFS DKMS 源码包..."
@@ -456,6 +484,14 @@ install_build_base() {
         error "zfs-dkms 安装失败，请确认 Debian contrib 源可用"
         return 1
     fi
+
+    # 兼容处理：部分新版 DKMS (如 DKMS 3.1+) 对 AUTOINSTALL="Y" 大小写敏感
+    for dkms_conf in /usr/src/zfs-*/dkms.conf; do
+        if [[ -f "$dkms_conf" ]] && grep -q 'AUTOINSTALL="Y"' "$dkms_conf" 2>/dev/null; then
+            info "修正 ${dkms_conf} 中 AUTOINSTALL 配置..."
+            sed -i 's/AUTOINSTALL="Y"/AUTOINSTALL="yes"/' "$dkms_conf" 2>/dev/null || true
+        fi
+    done
 
     local zfs_ver
     zfs_ver=$(get_zfs_dkms_version || true)
@@ -572,6 +608,7 @@ META
 
     mkdir -p "$OUTPUT_DIR"
     tar -czf "${OUTPUT_DIR}/${package_name}.tar.gz" -C "$pack_tmp" "${package_name}/"
+    chmod -R a+rX "$OUTPUT_DIR" 2>/dev/null || true
 
     local file_size
     file_size=$(du -h "${OUTPUT_DIR}/${package_name}.tar.gz" | awk '{print $1}')

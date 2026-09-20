@@ -41,6 +41,7 @@ APT 源启用 `contrib` 组件。
 5. `architectures` 默认是 `amd64 arm64`，会生成和现有 Release 一致的双架构包。
 6. `kernels` 默认填 `all`，表示构建当前 Debian 镜像中 APT 源可见的目标内核版本。
 7. `skip_existing_release` 默认开启，会自动跳过 `release_tag` 中已经存在的同名产物。
+8. `arm_runner` 默认是 `ubuntu-24.04-arm`（原生 ARM64 runner 快速编译）；如果在没有 ARM 配额的私有仓库或个人账户中运行，可选择 `ubuntu-24.04`，构建任务会自动通过 QEMU 模拟环境完成编译。
 
 ```text
 6.1.0-37-amd64 6.1.0-37-cloud-amd64
@@ -62,9 +63,9 @@ workflow 会先生成待构建列表，然后按单个内核版本拆分成矩�
 架构或内核版本耗时较长时，已经完成的产物会先作为 artifact 保存，最后再统一发布到
 Release。
 
-矩阵构建会按架构选择宿主 runner：`amd64` 使用 `ubuntu-24.04`，`arm64` 使用
-`ubuntu-24.04-arm`。这样 arm64 包会在原生 arm64 runner 上构建，不再通过 QEMU 在
-x64 runner 上模拟编译。
+矩阵构建会按架构选择宿主 runner：`amd64` 使用 `ubuntu-24.04`，`arm64` 默认使用
+`ubuntu-24.04-arm`。在 `build` 阶段已内置 QEMU 跨架构支持，即使降级使用 x64 runner
+也能稳定完成 arm64 构建。
 
 如果所有目标产物都已经存在，workflow 会正常结束，不会上传新的 artifact，也不会
 重复发布 Release asset。
