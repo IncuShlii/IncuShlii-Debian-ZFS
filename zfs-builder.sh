@@ -195,14 +195,44 @@ is_supported_kernel_version() {
 
 kernel_requires_backports_zfs() {
     local kver="$1"
+    local codename="${2:-}"
+    if [[ -z "$codename" && -f /etc/os-release ]]; then
+        codename=$(. /etc/os-release && echo "${VERSION_CODENAME:-}")
+    fi
+
     local major minor
     major=$(echo "$kver" | cut -d. -f1)
     minor=$(echo "$kver" | cut -d. -f2 | cut -d- -f1 | cut -d+ -f1)
-    if [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]]; then
-        if (( major > 6 || (major == 6 && minor >= 2) )); then
-            return 0
-        fi
-    fi
+    [[ "$major" =~ ^[0-9]+$ ]] || return 1
+
+    case "$codename" in
+        bookworm)
+            # Debian 12 (bookworm) 默认 6.1 内核；6.2+ 来自 bookworm-backports
+            if [[ "$minor" =~ ^[0-9]+$ ]]; then
+                if (( major > 6 || (major == 6 && minor >= 2) )); then
+                    return 0
+                fi
+            fi
+            ;;
+        bullseye)
+            # Debian 11 (bullseye) 默认 5.10 内核；6.x 来自 bullseye-backports
+            if (( major >= 6 )); then
+                return 0
+            fi
+            ;;
+        trixie)
+            # Debian 13 (trixie) 默认就是 6.12+ 内核，源内已包含兼容的 zfs-dkms，无需 backports
+            return 1
+            ;;
+        *)
+            # 其他发行版默认根据版本判断
+            if [[ "$minor" =~ ^[0-9]+$ ]]; then
+                if (( major > 6 || (major == 6 && minor >= 2) )); then
+                    return 0
+                fi
+            fi
+            ;;
+    esac
     return 1
 }
 
@@ -485,7 +515,7 @@ install_build_base() {
     # 检查是否需要 backports 支持 (Linux 6.2+ 内核)
     local need_backports_zfs=false
     for k in "${TARGET_KERNELS[@]}"; do
-        if kernel_requires_backports_zfs "$k"; then
+        if kernel_requires_backports_zfs "$k" "$codename"; then
             need_backports_zfs=true
             break
         fi
@@ -574,7 +604,7 @@ build_for_kernel() {
         codename=$(. /etc/os-release && echo "${VERSION_CODENAME:-}")
     fi
     local -a apt_target_args=()
-    if kernel_requires_backports_zfs "$kernel_ver" && [[ -n "$codename" ]]; then
+    if kernel_requires_backports_zfs "$kernel_ver" "$codename" && [[ -n "$codename" ]]; then
         apt_target_args=(-t "${codename}-backports")
         # 确保已安装匹配该内核的 backports zfs-dkms (例如在交互式菜单先编 6.1 后编 6.12 的情况)
         local current_zfs_ver
