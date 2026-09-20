@@ -37,6 +37,14 @@ on:
         required: true
         type: boolean
         default: true
+      arm_runner:
+        description: Runner label for arm64 targets (ubuntu-24.04-arm for native ARM or ubuntu-24.04 for QEMU emulation)
+        required: true
+        type: choice
+        default: ubuntu-24.04-arm
+        options:
+          - ubuntu-24.04-arm
+          - ubuntu-24.04
 
 permissions:
   contents: write
@@ -86,6 +94,7 @@ jobs:
           KERNELS: ${{ inputs.kernels }}
           ARCHITECTURES: ${{ inputs.architectures }}
           SKIP_EXISTING_RELEASE: ${{ inputs.skip_existing_release }}
+          ARM_RUNNER: ${{ inputs.arm_runner }}
         run: |
           set -euo pipefail
 
@@ -164,7 +173,7 @@ jobs:
 
                   case "${arch}" in
                     amd64) runner="ubuntu-24.04" ;;
-                    arm64) runner="ubuntu-24.04-arm" ;;
+                    arm64) runner="${ARM_RUNNER:-ubuntu-24.04-arm}" ;;
                     *) echo "Unsupported architecture: ${arch}" >&2; return 1 ;;
                   esac
 
@@ -228,6 +237,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Set up QEMU for multi-arch containers
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+
       - name: Build package in Debian container
         env:
           DEBIAN_IMAGE: debian:${{ inputs.debian_image }}
@@ -251,6 +265,9 @@ jobs:
             -w /workspace \
             "${DEBIAN_IMAGE}" \
             bash zfs-builder.sh --ci --kernel "${TARGET_KERNEL}"
+
+          # Ensure artifact permissions are readable by host runner
+          chmod -R a+rX output 2>/dev/null || true
 
       - name: Upload package artifact
         uses: actions/upload-artifact@v7
